@@ -38,6 +38,8 @@
 // And those used for inputs
 #define HOOK_PIN 0
 #define PLAYBACK_BUTTON_PIN 1
+#define ROTARY_ENGAGE_PIN 2
+#define ROTARY_ENCODE_PIN 3
 
 #define noINSTRUMENT_SD_WRITE
 
@@ -65,10 +67,17 @@ File frec;
 // Use long 40ms debounce time on both switches
 Bounce buttonRecord = Bounce(HOOK_PIN, 40);
 Bounce buttonPlay = Bounce(PLAYBACK_BUTTON_PIN, 40);
+Bounce rotaryEngage = Bounce(ROTARY_ENGAGE_PIN, 40);
+Bounce rotaryEncode = Bounce(ROTARY_ENCODE_PIN, 15);
 
 // Keep track of current state of the device
-enum Mode {Initialising, Ready, Prompting, Recording, Playing};
+enum Mode {Initialising, Ready, Prompting, Recording, PostRecording, Playing};
 Mode mode = Mode::Initialising;
+
+enum Lang {EN, ES, FR, JA};
+Lang lang = Lang::EN;
+
+enum Input {NoInput, HungUp, PlayButton, Dial1, Dial2, Dial3, Dial4, Dial5, Dial6, Dial7, Dial8, Dial9, Dial0};
 
 float beep_volume = 0.04f; // not too loud :-)
 
@@ -92,7 +101,7 @@ byte byte1, byte2, byte3, byte4;
 void setup() {
 
   Serial.begin(9600);
-  while (!Serial && millis() < 5000) {
+  while (!Serial && millis() < 6000) {
     // wait for serial port to connect.
   }
   Serial.println("Serial set up correctly");
@@ -101,6 +110,8 @@ void setup() {
   // Configure the input pins
   pinMode(HOOK_PIN, INPUT_PULLUP);
   pinMode(PLAYBACK_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(ROTARY_ENGAGE_PIN, INPUT_PULLUP);
+  pinMode(ROTARY_ENCODE_PIN, INPUT_PULLUP);
 
   // Audio connections require memory, and the record queue
   // uses this memory to buffer incoming audio.
@@ -164,11 +175,13 @@ void loop() {
   // First, read the buttons
   buttonRecord.update();
   buttonPlay.update();
+  rotaryEngage.update();
 
   switch(mode){
     case Mode::Ready:
+      lang = Lang::EN;
       // Falling edge occurs when the handset is lifted --> 611 telephone
-      if (buttonRecord.fallingEdge()) {
+      if (buttonRecord.risingEdge()) {
         Serial.println("Handset lifted");
         mode = Mode::Prompting; print_mode();
       }
@@ -176,25 +189,75 @@ void loop() {
         //playAllRecordings();
         playLastRecording();
       }
+      else if (rotaryEngage.fallingEdge()) {
+        Serial.println("Dial moved");
+          Input i = dial_wait();
+          print_Input(i);
+      }
       break;
 
     case Mode::Prompting:
       // Wait a second for users to put the handset to their ear
       wait(1000);
-      // Play the greeting inviting them to record their message
-      playWav1.play("greeting.wav");    
-      // Wait until the  message has finished playing
-//      while (playWav1.isPlaying()) {
+      // Play the greeting inviting them to select their language
+      playWav1.play("LanguageSelect.wav");    
+      // Wait the message is playing
       while (!playWav1.isStopped()) {
         // Check whether the handset is replaced
         buttonRecord.update();
         buttonPlay.update();
+        rotaryEngage.update();
+        // Rotary dial is used
+        if (rotaryEngage.fallingEdge()) {
+          Input i = dial_wait();
+          print_Input(i);
+          switch(i) {
+            case Input::HungUp:
+              playWav1.stop();
+              mode = Mode::Ready; print_mode();
+              return;
+            case Input::PlayButton:
+              playWav1.stop();
+              //playAllRecordings();
+              playLastRecording();
+              return;
+            case Input::Dial1: //EN
+              lang = Lang::EN;
+              playWav1.stop();
+              playWav1.play("EN_preInstructions.wav");
+              break;
+            case Input::Dial2: //ES
+              lang = Lang::ES;
+              playWav1.stop();
+              playWav1.play("ES_preInstructions.wav");
+              break;
+            case Input::Dial3: //FR
+              lang = Lang::FR;
+              playWav1.stop();
+              playWav1.play("FR_preInstructions.wav");
+              break;
+            case Input::Dial4: //JA
+              lang = Lang::JA;
+              playWav1.stop();
+              playWav1.play("JA_preInstructions.wav");
+              break;
+            case Input::Dial5: 
+            case Input::Dial6: 
+            case Input::Dial7: 
+            case Input::Dial8: 
+            case Input::Dial9: 
+            case Input::Dial0: 
+            case Input::NoInput:
+              break;
+          }
+        }
         // Handset is replaced
-        if(buttonRecord.risingEdge()) {
+        if(buttonRecord.fallingEdge()) {
           playWav1.stop();
           mode = Mode::Ready; print_mode();
           return;
         }
+        // Playback button is pressed
         if(buttonPlay.fallingEdge()) {
           playWav1.stop();
           //playAllRecordings();
@@ -215,18 +278,28 @@ void loop() {
 
     case Mode::Recording:
       // Handset is replaced
-      if(buttonRecord.risingEdge()){
+      if(buttonRecord.fallingEdge() || rotaryEngage.fallingEdge()){
         // Debug log
         Serial.println("Stopping Recording");
         // Stop recording
         stopRecording();
         // Play audio tone to confirm recording has ended
         end_Beep();
+        if (buttonRecord.fallingEdge()) {
+          mode = Mode::Ready; print_mode();
+        } else {
+          mode = Mode::PostRecording; print_mode();
+        }
       }
       else {
         continueRecording();
       }
       break;
+
+    case Mode::PostRecording:
+      end_Beep();
+      mode = Mode::Ready; print_mode();
+    break;
 
     case Mode::Playing: // to make compiler happy
       break;  
@@ -338,7 +411,6 @@ void stopRecording() {
   // Close the file
   frec.close();
   Serial.println("Closed file");
-  mode = Mode::Ready; print_mode();
   setMTPdeviceChecks(true); // enable MTP device checks, recording is finished
 }
 
@@ -382,7 +454,7 @@ void playAllRecordings() {
       buttonRecord.update();
       // Button is pressed again
 //      if(buttonPlay.risingEdge() || buttonRecord.risingEdge()) { // FIX
-      if(buttonPlay.fallingEdge() || buttonRecord.risingEdge()) { 
+      if(buttonPlay.fallingEdge() || buttonRecord.fallingEdge()) { 
         playWav1.stop();
         mode = Mode::Ready; print_mode();
         return;
@@ -415,7 +487,7 @@ void playLastRecording() {
       buttonRecord.update();
       // Button is pressed again
 //      if(buttonPlay.risingEdge() || buttonRecord.risingEdge()) { // FIX
-      if(buttonPlay.fallingEdge() || buttonRecord.risingEdge()) {
+      if(buttonPlay.fallingEdge() || buttonRecord.fallingEdge()) {
         playWav1.stop();
         mode = Mode::Ready; print_mode();
         return;
@@ -540,7 +612,77 @@ void print_mode(void) { // only for debugging
   if(mode == Mode::Ready)           Serial.println(" Ready");
   else if(mode == Mode::Prompting)  Serial.println(" Prompting");
   else if(mode == Mode::Recording)  Serial.println(" Recording");
+  else if(mode == Mode::PostRecording)  Serial.println(" PostRecording");
   else if(mode == Mode::Playing)    Serial.println(" Playing");
   else if(mode == Mode::Initialising)  Serial.println(" Initialising");
   else Serial.println(" Undefined");
+}
+
+void print_Input(Input i) {
+  Serial.print("Input is: ");
+  if (i == Input::NoInput)    Serial.println("No input");
+  else if (i == Input::HungUp)    Serial.println("Hung up");
+  else if (i == Input::PlayButton)    Serial.println("Playback button");
+  else if (i == Input::Dial1)    Serial.println("Dial 1");
+  else if (i == Input::Dial2)    Serial.println("Dial 2");
+  else if (i == Input::Dial3)    Serial.println("Dial 3");
+  else if (i == Input::Dial4)    Serial.println("Dial 4");
+  else if (i == Input::Dial5)    Serial.println("Dial 5");
+  else if (i == Input::Dial6)    Serial.println("Dial 6");
+  else if (i == Input::Dial7)    Serial.println("Dial 7");
+  else if (i == Input::Dial8)    Serial.println("Dial 8");
+  else if (i == Input::Dial9)    Serial.println("Dial 9");
+  else if (i == Input::Dial0)    Serial.println("Dial 0");
+  else Serial.println(" Undefined");
+}
+
+//Called after starting to dial (rotaryEngage.fallingEdge)
+Input dial_wait() {
+  int rotaryNum = 0;
+
+  while (!rotaryEngage.risingEdge()) {
+    // First, read the buttons
+    buttonRecord.update();
+    buttonPlay.update();
+    rotaryEngage.update();
+    rotaryEncode.update();
+  
+    if (rotaryEngage.fallingEdge()) {
+      Serial.println("Rotary Engage falling edge error!");
+      return Input::NoInput;
+    }
+
+    if (rotaryEncode.risingEdge()) {
+      rotaryNum += 1;
+    }
+
+    if (buttonRecord.fallingEdge()) {
+      return Input::HungUp;
+    }
+
+    if (buttonPlay.fallingEdge()) {
+      return Input::PlayButton;
+    }
+  }
+
+  if (rotaryNum <= 1) {
+    return Input::NoInput;
+  }
+
+  if (rotaryNum == 2) return Input::Dial1;
+  if (rotaryNum == 3) return Input::Dial2;
+  if (rotaryNum == 4) return Input::Dial3;
+  if (rotaryNum == 5) return Input::Dial4;
+  if (rotaryNum == 6) return Input::Dial5;
+  if (rotaryNum == 7) return Input::Dial6;
+  if (rotaryNum == 8) return Input::Dial7;
+  if (rotaryNum == 9) return Input::Dial8;
+  if (rotaryNum == 10) return Input::Dial9;
+  if (rotaryNum == 11) return Input::Dial0;
+
+  if (rotaryNum > 11) {
+    Serial.println("RotaryNum too high!");
+    return Input::NoInput;
+  }
+  return Input::NoInput;
 }
