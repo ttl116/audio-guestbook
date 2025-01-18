@@ -4,18 +4,13 @@
  * Tested using a Teensy 4.0 with Teensy Audio Shield, although should work 
  * with minor modifications on other similar hardware
  * 
- * When handset is lifted, a pre-recorded greeting message is played, followed by a tone.
- * Then, recording starts, and continues until the handset is replaced.
- * Playback button allows all messages currently saved on SD card through earpiece 
+ * When handset is lifted, a pre-recorded greeting message is played to ask users to select different options using the dial.
+ * Depending on the dialed selection, a different greeting message is played, followed by a tone.
+ * Then, recording starts, and continues until the handset is replaced, or a number is dialled again.
+ * The message just recorded will be played back to the user.
+ * There are also hidden 'secret' functions available at the initial greeting stage, depending on the number dialled.
  * 
- * Files are saved on SD card as 44.1kHz, 16-bit, mono signed integer RAW audio format 
- * --> changed this to WAV recording, DD4WH 2022_07_31
- * --> added MTP support, which enables copying WAV files from the SD card via the USB connection, DD4WH 2022_08_01
- * 
- * 
- * Frank DD4WH, August 1st 2022 
- * for a DBP 611 telephone (closed contact when handheld is lifted) & with recording to WAV file
- * contact for switch button 0 is closed when handheld is lifted
+ * Files are saved on SD card as WAV recordings
  * 
  * GNU GPL v3.0 license
  * 
@@ -36,10 +31,10 @@
 #define SDCARD_MOSI_PIN  7
 #define SDCARD_SCK_PIN   14
 // And those used for inputs
-#define HOOK_PIN 0
-#define PLAYBACK_BUTTON_PIN 1
-#define ROTARY_ENGAGE_PIN 2
-#define ROTARY_ENCODE_PIN 3
+#define HOOK_PIN 0 // handset
+#define PLAYBACK_BUTTON_PIN 1 // playback button
+#define ROTARY_ENGAGE_PIN 2 // rotary dial - detects when dial starts to turn
+#define ROTARY_ENCODE_PIN 3 // rotary dial - detects the number dialled
 
 #define noINSTRUMENT_SD_WRITE
 
@@ -64,7 +59,7 @@ char filename[15];
 // The file object itself
 File frec;
 
-// Use long 40ms debounce time on both switches
+// Use long 40ms debounce time on both switches, and short 15ms debounce time for encoding dial mechanism
 Bounce buttonRecord = Bounce(HOOK_PIN, 40);
 Bounce buttonPlay = Bounce(PLAYBACK_BUTTON_PIN, 40);
 Bounce rotaryEngage = Bounce(ROTARY_ENGAGE_PIN, 40);
@@ -74,12 +69,14 @@ Bounce rotaryEncode = Bounce(ROTARY_ENCODE_PIN, 15);
 enum Mode {Initialising, Ready, Prompting, Recording, PostRecording, Playing};
 Mode mode = Mode::Initialising;
 
+// Keep track of the selected language
 enum Lang {EN, ES, FR, JA};
 Lang lang = Lang::EN;
 
-enum Input {NoInput, HungUp, PlayButton, Dial1, Dial2, Dial3, Dial4, Dial5, Dial6, Dial7, Dial8, Dial9, Dial0};
+// Keep track of the system inputs
+enum Input {NoInput, HungUp, PlayButtonDown, PlayButtonUp, Dial1, Dial2, Dial3, Dial4, Dial5, Dial6, Dial7, Dial8, Dial9, Dial0};
 
-float beep_volume = 0.04f; // not too loud :-)
+float beep_volume = 0.03f; // not too loud :-)
 
 uint32_t MTPcheckInterval; // default value of device check interval [ms]
 
@@ -102,7 +99,7 @@ void setup() {
 
   Serial.begin(9600);
   while (!Serial && millis() < 6000) {
-    // wait for serial port to connect.
+    // wait for serial port to connect. Must be larger than 6000 for enough setup time
   }
   Serial.println("Serial set up correctly");
   Serial.printf("Audio block set to %d samples\n",AUDIO_BLOCK_SAMPLES);
@@ -113,16 +110,15 @@ void setup() {
   pinMode(ROTARY_ENGAGE_PIN, INPUT_PULLUP);
   pinMode(ROTARY_ENCODE_PIN, INPUT_PULLUP);
 
-  // Audio connections require memory, and the record queue
-  // uses this memory to buffer incoming audio.
+  // Audio connections require memory, and the record queue uses this memory to buffer incoming audio.
   AudioMemory(60);
 
   // Enable the audio shield, select input, and enable output
   sgtl5000_1.enable();
   // Define which input on the audio shield to use (AUDIO_INPUT_LINEIN / AUDIO_INPUT_MIC)
   sgtl5000_1.inputSelect(AUDIO_INPUT_MIC);
-  //sgtl5000_1.adcHighPassFilterDisable(); //
-  sgtl5000_1.volume(0.95);
+  //sgtl5000_1.adcHighPassFilterDisable()
+  sgtl5000_1.volume(0.75);
 
   mixer.gain(0, 1.0f);
   mixer.gain(1, 1.0f);
@@ -147,18 +143,16 @@ void setup() {
     else Serial.println("SD card correctly initialized");
 
 
-  // mandatory to begin the MTP session.
-    MTP.begin();
+  // Mandatory to begin the MTP session.
+  MTP.begin();
 
   // Add SD Card
-//    MTP.addFilesystem(SD, "SD Card");
-    MTP.addFilesystem(SD, "Kais Audio guestbook"); // choose a nice name for the SD card volume to appear in your file explorer
-    Serial.println("Added SD card via MTP");
-    MTPcheckInterval = MTP.storage()->get_DeltaDeviceCheckTimeMS();
+  MTP.addFilesystem(SD, "Kais Audio guestbook"); // choose a nice name for the SD card volume to appear in your file explorer
+  Serial.println("Added SD card via MTP");
+  MTPcheckInterval = MTP.storage()->get_DeltaDeviceCheckTimeMS();
     
-    // Value in dB
-//  sgtl5000_1.micGain(15);
-  sgtl5000_1.micGain(5); // much lower gain is required for the AOM5024 electret capsule
+  // Value in dB
+  sgtl5000_1.micGain(20); // much lower gain is required for the AOM5024 electret capsule
 
   // Synchronise the Time object used in the program code with the RTC time provider.
   // See https://github.com/PaulStoffregen/Time
@@ -180,19 +174,13 @@ void loop() {
   switch(mode){
     case Mode::Ready:
       lang = Lang::EN;
-      // Falling edge occurs when the handset is lifted --> 611 telephone
+      // Rising edge = handset lifted
       if (buttonRecord.risingEdge()) {
         Serial.println("Handset lifted");
         mode = Mode::Prompting; print_mode();
       }
       else if(buttonPlay.fallingEdge()) {
-        //playAllRecordings();
         playLastRecording();
-      }
-      else if (rotaryEngage.fallingEdge()) {
-        Serial.println("Dial moved");
-          Input i = dial_wait();
-          print_Input(i);
       }
       break;
 
@@ -200,10 +188,9 @@ void loop() {
       // Wait a second for users to put the handset to their ear
       wait(1000);
       // Play the greeting inviting them to select their language
-      playWav1.play("LanguageSelect.wav");    
-      // Wait the message is playing
+      playWav1.play("Greeting0.wav");
+      // While the message is playing (is not stopped)
       while (!playWav1.isStopped()) {
-        // Check whether the handset is replaced
         buttonRecord.update();
         buttonPlay.update();
         rotaryEngage.update();
@@ -216,37 +203,56 @@ void loop() {
               playWav1.stop();
               mode = Mode::Ready; print_mode();
               return;
-            case Input::PlayButton:
+            case Input::PlayButtonDown:
               playWav1.stop();
-              //playAllRecordings();
               playLastRecording();
               return;
-            case Input::Dial1: //EN
+            case Input::Dial1:
               lang = Lang::EN;
               playWav1.stop();
-              playWav1.play("EN_preInstructions.wav");
+              playWav1.play("Greeting1.wav");
               break;
-            case Input::Dial2: //ES
+            case Input::Dial2:
               lang = Lang::ES;
               playWav1.stop();
-              playWav1.play("ES_preInstructions.wav");
+              playWav1.play("Greeting2.wav");
               break;
-            case Input::Dial3: //FR
+            case Input::Dial3:
               lang = Lang::FR;
               playWav1.stop();
-              playWav1.play("FR_preInstructions.wav");
+              playWav1.play("Greeting3.wav");
               break;
-            case Input::Dial4: //JA
-              lang = Lang::JA;
+            case Input::Dial4:
               playWav1.stop();
-              playWav1.play("JA_preInstructions.wav");
+              playWav1.play("Greeting0.wav");
               break;
-            case Input::Dial5: 
-            case Input::Dial6: 
-            case Input::Dial7: 
-            case Input::Dial8: 
-            case Input::Dial9: 
-            case Input::Dial0: 
+            case Input::Dial5:
+              break;
+            case Input::Dial6:
+              playWav1.stop();
+              playWav1.play("Debug1.wav");
+              mode = Mode::Playing; print_mode();
+              return;
+            case Input::Dial7:
+              playWav1.stop();
+              playWav1.play("Debug2.wav");
+              mode = Mode::Playing; print_mode();
+              return;
+            case Input::Dial8:
+              playWav1.stop();
+              playWav1.play("Debug3.wav");
+              mode = Mode::Playing; print_mode();
+              return;
+            case Input::Dial9:
+              playWav1.stop();
+              playWav1.play("Debug4.wav");
+              mode = Mode::Playing; print_mode();
+              return;
+            case Input::Dial0:
+              playWav1.stop();
+              playAllRecordings();
+              return;
+            case Input::PlayButtonUp:
             case Input::NoInput:
               break;
           }
@@ -260,7 +266,6 @@ void loop() {
         // Playback button is pressed
         if(buttonPlay.fallingEdge()) {
           playWav1.stop();
-          //playAllRecordings();
           playLastRecording();
           return;
         }
@@ -277,31 +282,64 @@ void loop() {
       break;
 
     case Mode::Recording:
-      // Handset is replaced
-      if(buttonRecord.fallingEdge() || rotaryEngage.fallingEdge()){
-        // Debug log
-        Serial.println("Stopping Recording");
-        // Stop recording
-        stopRecording();
-        // Play audio tone to confirm recording has ended
-        end_Beep();
-        if (buttonRecord.fallingEdge()) {
-          mode = Mode::Ready; print_mode();
-        } else {
-          mode = Mode::PostRecording; print_mode();
+      {
+        bool hungUp = buttonRecord.fallingEdge();
+        // Handset is replaced OR started to dial
+        if(hungUp || rotaryEngage.fallingEdge()){
+          // Debug log
+          Serial.println("Stopping Recording");
+          // Stop recording
+          stopRecording();
+          // Play audio tone to confirm recording has ended
+          end_Beep();
+          if (hungUp) {
+            mode = Mode::Ready; print_mode();
+          } else {
+            mode = Mode::PostRecording; print_mode();
+          }
         }
-      }
-      else {
-        continueRecording();
+        else {
+          continueRecording();
+        }
       }
       break;
 
     case Mode::PostRecording:
-      end_Beep();
-      mode = Mode::Ready; print_mode();
-    break;
+      {
+        Input i = dial_wait();
+        print_Input(i);
+        switch(i) {
+          case Input::HungUp:
+            end_Beep();
+            mode = Mode::Ready; print_mode();
+            return;
+          case Input::Dial1:
+          case Input::Dial2:
+          case Input::Dial3:
+          case Input::Dial4:
+          case Input::Dial5:
+          case Input::Dial6:
+          case Input::Dial7:
+          case Input::Dial8:
+          case Input::Dial9:
+          case Input::Dial0:
+          case Input::NoInput:
+            playLastRecording();
+            break;
+          case Input::PlayButtonDown:
+          case Input::PlayButtonUp:
+            break;
+        }
+        mode = Mode::Ready; print_mode();
+      }
+      break;
 
     case Mode::Playing: // to make compiler happy
+      if(buttonRecord.fallingEdge()) {
+        playWav1.stop();
+        mode = Mode::Ready; print_mode();
+        return;
+      }
       break;  
 
     case Mode::Initialising: // to make compiler happy
@@ -338,10 +376,9 @@ void startRecording() {
   printNext = 0;
 #endif // defined(INSTRUMENT_SD_WRITE)
   // Find the first available file number
-//  for (uint8_t i=0; i<9999; i++) { // BUGFIX uint8_t overflows if it reaches 255  
   for (uint16_t i=0; i<9999; i++) {   
     // Format the counter as a five-digit number with leading zeroes, followed by file extension
-    snprintf(filename, 11, " %05d.wav", i);
+    snprintf(filename, 15, " msg/%05d.wav", i);
     // Create if does not exist, do not open existing, write, sync after write
     if (!SD.exists(filename)) {
       break;
@@ -416,51 +453,123 @@ void stopRecording() {
 
 
 void playAllRecordings() {
+  playWav1.play("Greeting4.wav");
+
+  while (!playWav1.isStopped()) {
+    buttonPlay.update();
+    buttonRecord.update();
+    // Handset is put down
+    if(buttonRecord.fallingEdge()) { 
+      playWav1.stop();
+      mode = Mode::Ready; print_mode();
+      return;
+    }   
+  }
   // Recording files are saved in the root directory
-  File dir = SD.open("/");
+  File dir = SD.open("/msg/");
   
+  int skips = 0;
+
   while (true) {
     File entry =  dir.openNextFile();
-    if (strstr(entry.name(), "greeting"))
-    {
-       entry =  dir.openNextFile();
-    }
     if (!entry) {
       // no more files
       entry.close();
       end_Beep();
       break;
     }
-    //int8_t len = strlen(entry.name()) - 4;
-//    if (strstr(strlwr(entry.name() + (len - 4)), ".raw")) {
-//    if (strstr(strlwr(entry.name() + (len - 4)), ".wav")) {
-    // the lines above throw a warning, so I replace them with this (which is also easier to read):
+
+    if (skips>0) {
+      skips--;
+      entry.close();
+      continue;
+    }
+
     if (strstr(entry.name(), ".wav") || strstr(entry.name(), ".WAV")) {
       Serial.print("Now playing ");
       Serial.println(entry.name());
+      snprintf(filename, 15, "msg/%s",entry.name());
+      entry.close();
       // Play a short beep before each message
       waveform1.amplitude(beep_volume);
       wait(750);
       waveform1.amplitude(0);
       // Play the file
-      playWav1.play(entry.name());
+      playWav1.play(filename);
       mode = Mode::Playing; print_mode();
     }
-    entry.close();
-
-//    while (playWav1.isPlaying()) { // strangely enough, this works for playRaw, but it does not work properly for playWav
-    while (!playWav1.isStopped()) { // this works for playWav
+    
+    while (!playWav1.isStopped()) {
       buttonPlay.update();
       buttonRecord.update();
-      // Button is pressed again
-//      if(buttonPlay.risingEdge() || buttonRecord.risingEdge()) { // FIX
-      if(buttonPlay.fallingEdge() || buttonRecord.fallingEdge()) { 
+      rotaryEngage.update();
+      // Handset is put down
+      if(buttonRecord.fallingEdge()) { 
         playWav1.stop();
         mode = Mode::Ready; print_mode();
+        dir.close();
         return;
-      }   
+      }
+      if (rotaryEngage.fallingEdge()) {
+          Input i = dial_wait();
+          print_Input(i);
+          switch(i) {
+            case Input::HungUp:
+              playWav1.stop();
+              mode = Mode::Ready; print_mode();
+              dir.close();
+              return;
+            case Input::Dial1:
+              playWav1.stop();
+              skips += 0;
+              break;
+            case Input::Dial2:
+              playWav1.stop();
+              skips += 1;
+              break;
+            case Input::Dial3:
+              playWav1.stop();
+              skips += 2;
+              break;
+            case Input::Dial4:
+              playWav1.stop();
+              skips += 3;
+              break;
+            case Input::Dial5:
+              playWav1.stop();
+              skips += 4;
+              break;
+            case Input::Dial6:
+              playWav1.stop();
+              skips += 5;
+              break;
+            case Input::Dial7:
+              playWav1.stop();
+              skips += 6;
+              break;
+            case Input::Dial8:
+              playWav1.stop();
+              skips += 7;
+              break;
+            case Input::Dial9:
+              playWav1.stop();
+              skips += 8;
+              break;
+            case Input::Dial0:
+              playWav1.stop();
+              entry.close();
+              dir.close();
+              dir = SD.open("/msg/");
+              break;
+            case Input::NoInput:
+            case Input::PlayButtonUp:
+            case Input::PlayButtonDown:
+              break;
+          }
+        }
     }
   }
+  dir.close();
   // All files have been played
   mode = Mode::Ready; print_mode();
 }
@@ -470,29 +579,28 @@ void playLastRecording() {
   uint16_t idx = 0; 
   for (uint16_t i=0; i<9999; i++) {
     // Format the counter as a five-digit number with leading zeroes, followed by file extension
-    snprintf(filename, 11, " %05d.wav", i);
+    snprintf(filename, 15, " msg/%05d.wav", i);
     // check, if file with index i exists
     if (!SD.exists(filename)) {
      idx = i - 1;
      break;
       }
   }
-      // now play file with index idx == last recorded file
-      snprintf(filename, 11, " %05d.wav", idx);
-      Serial.println(filename);
-      playWav1.play(filename);
-      mode = Mode::Playing; print_mode();
-      while (!playWav1.isStopped()) { // this works for playWav
-      buttonPlay.update();
-      buttonRecord.update();
-      // Button is pressed again
-//      if(buttonPlay.risingEdge() || buttonRecord.risingEdge()) { // FIX
-      if(buttonPlay.fallingEdge() || buttonRecord.fallingEdge()) {
-        playWav1.stop();
-        mode = Mode::Ready; print_mode();
-        return;
-      }   
-    }
+  // now play file with index idx == last recorded file
+  snprintf(filename, 15, " msg/%05d.wav", idx);
+  Serial.println(filename);
+  playWav1.play(filename);
+  mode = Mode::Playing; print_mode();
+  while (!playWav1.isStopped()) { // this works for playWav
+    buttonPlay.update();
+    buttonRecord.update();
+    // Button is pressed again or handset is replaced
+    if(buttonPlay.risingEdge() || buttonRecord.fallingEdge()) {
+      playWav1.stop();
+      mode = Mode::Ready; print_mode();
+      return;
+    }   
+  }
       // file has been played
   mode = Mode::Ready; print_mode();  
   end_Beep();
@@ -531,7 +639,6 @@ void wait(unsigned int milliseconds) {
     if (buttonPlay.risingEdge()) Serial.println("Button (pin 1) Release");
   }
 }
-
 
 void writeOutHeader() { // update WAV header with final filesize/datasize
 
@@ -622,7 +729,8 @@ void print_Input(Input i) {
   Serial.print("Input is: ");
   if (i == Input::NoInput)    Serial.println("No input");
   else if (i == Input::HungUp)    Serial.println("Hung up");
-  else if (i == Input::PlayButton)    Serial.println("Playback button");
+  else if (i == Input::PlayButtonDown)    Serial.println("Playback button pressed");
+  else if (i == Input::PlayButtonUp)    Serial.println("Playback button released");
   else if (i == Input::Dial1)    Serial.println("Dial 1");
   else if (i == Input::Dial2)    Serial.println("Dial 2");
   else if (i == Input::Dial3)    Serial.println("Dial 3");
@@ -636,10 +744,12 @@ void print_Input(Input i) {
   else Serial.println(" Undefined");
 }
 
-//Called after starting to dial (rotaryEngage.fallingEdge)
+// Called after starting to dial (rotaryEngage.fallingEdge is detected)
 Input dial_wait() {
+  Serial.println("Dial waiting");
   int rotaryNum = 0;
 
+  // Rising edge = rotary mechanism has returned from dialled to neutral position - so while still waiting for the dial to finish
   while (!rotaryEngage.risingEdge()) {
     // First, read the buttons
     buttonRecord.update();
@@ -652,6 +762,7 @@ Input dial_wait() {
       return Input::NoInput;
     }
 
+    // Counts the number dialled by counting number of connections made
     if (rotaryEncode.risingEdge()) {
       rotaryNum += 1;
     }
@@ -661,7 +772,11 @@ Input dial_wait() {
     }
 
     if (buttonPlay.fallingEdge()) {
-      return Input::PlayButton;
+      return Input::PlayButtonDown;
+    }
+
+    if (buttonPlay.risingEdge()) {
+      return Input::PlayButtonUp;
     }
   }
 
@@ -669,6 +784,7 @@ Input dial_wait() {
     return Input::NoInput;
   }
 
+  // One more connection is made than the number on the dial
   if (rotaryNum == 2) return Input::Dial1;
   if (rotaryNum == 3) return Input::Dial2;
   if (rotaryNum == 4) return Input::Dial3;
